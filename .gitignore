@@ -1,0 +1,20 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# Editor settings
+.idea/
+.vscode/
+
+# Generated logs and knowledge base files
+logs/
+chroma_db/
+/md5.text
+
+# Local records unrelated to stock backtesting
+/data/external/records.csv
