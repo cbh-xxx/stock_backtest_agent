@@ -1,0 +1,8 @@
+baostock>=0.9.4
+backtrader==1.9.78.123
+langchain-deepseek
+pandas
+pydantic>=2
+PyYAML
+streamlit
+Brotli>=1.2.1

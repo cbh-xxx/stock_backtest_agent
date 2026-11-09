@@ -5,10 +5,6 @@ project_root = os.path.dirname(current_dir)  # Agent 项目目录sys.path.insert
 sys.path.insert(0, project_root)
 from langchain.agents import create_agent
 from model.factory import chat_model
-from utils.prompt_loader import load_backtest_prompts
-from agent.tools.agent_tools import (parse_strategy_with_rag, execute_backtest, get_complete_market_data)
-# from agent.tools.agent_tools import (rag_summarize, get_weather, get_user_location, get_user_id,
-#                                      get_current_month, fetch_external_data, fill_context_for_report)
 from agent.tools.middleware import monitor_tool, log_before_model
 from langchain_core.tools import tool
 

@@ -2,7 +2,6 @@ from abc import ABC, abstractmethod
 from typing import Optional
 from langchain_core.embeddings import Embeddings
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_community.embeddings import DashScopeEmbeddings
 from langchain_deepseek import ChatDeepSeek
 
 import os
@@ -19,7 +18,7 @@ class BaseModelFactory(ABC):
     def generator(self) -> Optional[Embeddings | BaseChatModel]:
         pass
 
-# Agent、RAG 总结和策略生成共用此模型，密钥从 DEEPSEEK_API_KEY 读取。
+# 回测规则解析和原有 RAG 总结共用此模型，密钥从 DEEPSEEK_API_KEY 读取。
 class ChatModelFactory(BaseModelFactory):
     def generator(self) -> BaseChatModel:
         return ChatDeepSeek(
@@ -32,8 +31,9 @@ class ChatModelFactory(BaseModelFactory):
 # 嵌入模型工厂
 class EmbeddingsFactory(BaseModelFactory):
     def generator(self) -> Optional[Embeddings | BaseChatModel]:
+        from langchain_community.embeddings import DashScopeEmbeddings
+
         return DashScopeEmbeddings(model=rag_conf["embedding_model_name"])
 
 
 chat_model = ChatModelFactory().generator()
-embed_model = EmbeddingsFactory().generator()

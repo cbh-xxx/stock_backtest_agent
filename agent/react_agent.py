@@ -1,51 +1,87 @@
-import os
+import json
 import sys
-# 添加项目根目录到 Python 路径，解决直接运行时的导入问题
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.dirname(current_dir)  # Agent 项目目录sys.path.insert(0, project_root)
-sys.path.insert(0, project_root)
-from langchain.agents import create_agent
-from model.factory import chat_model
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+
+from langchain_core.output_parsers import StrOutputParser
+from pydantic import ValidationError
+
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from agent.backtest_spec import StrategySpec, StrategyUpdate
+from agent.tools.agent_tools import BacktestStageError, execute_backtest
+from utils.logger_handler import logger
 from utils.prompt_loader import load_backtest_prompts
-from agent.tools.agent_tools import (parse_strategy_with_rag, execute_backtest, get_complete_market_data)
-# from agent.tools.agent_tools import (rag_summarize, get_weather, get_user_location, get_user_id,
-#                                      get_current_month, fetch_external_data, fill_context_for_report)
-from agent.tools.middleware import monitor_tool, log_before_model
 
 
 class ReactAgent:
     def __init__(self):
-        self.agent = create_agent(
-        model=chat_model,
-        system_prompt=load_backtest_prompts(),  # 需要创建回测专用提示词
-        tools=[execute_backtest],
-        middleware=[monitor_tool, log_before_model],)
+        self._draft: StrategySpec | None = None
 
-        # self.agent = create_agent(
-        #     model=chat_model,
-        #     system_prompt=load_system_prompts(),
-        #     tools=[rag_summarize, get_weather, get_user_location, get_user_id,
-        #            get_current_month, fetch_external_data, fill_context_for_report],
-        #     middleware=[monitor_tool, log_before_model, report_prompt_switch],)
+    def _parse(self, query: str, today: date) -> StrategyUpdate:
+        from model.factory import chat_model
 
-    # 流式执行用户提示词
+        schema = json.dumps(StrategyUpdate.model_json_schema(), ensure_ascii=False)
+        context = json.dumps({
+            "today": str(today),
+            "draft": self._draft.model_dump(mode="json") if self._draft else None,
+            "request": query,
+        }, ensure_ascii=False)
+        messages = [
+            ("system", f"{load_backtest_prompts()}\n\nJSON Schema:\n{schema}"),
+            ("human", context),
+        ]
+        # JSON 模式只提取参数，行情和回测步骤由程序直接调用。
+        parser = chat_model.bind(
+            response_format={"type": "json_object"}, max_tokens=8192,
+        ) | StrOutputParser()
+        response = parser.invoke(messages)
+        # DeepSeek 的 JSON 模式偶尔返回空白内容，此时只重试一次。
+        if not response.strip():
+            response = parser.invoke(messages)
+        return StrategyUpdate.model_validate_json(response)
+
     def execute_stream(self, query: str):
-        input_dict = {
-            "messages": [
-                {"role": "user", "content": query},
-            ]
-        }
+        today = datetime.now(timezone(timedelta(hours=8))).date()
+        try:
+            update = self._parse(query, today)
+            if update.action == "unsupported":
+                yield "这个入口用于股票策略回测。请描述要回测的标的、日期和交易规则。"
+                return
+            existing = self._draft if update.action == "update" else None
+            fields = existing.model_dump() if existing else {}
+            fields.update(update.changes.model_dump(exclude_unset=True))
+            self._draft = StrategySpec.model_validate(fields)
+        except ValidationError as exc:
+            logger.warning("策略参数校验失败：%s", exc.errors(include_input=False))
+            locations = "、".join(
+                ".".join(map(str, issue["loc"])) or "策略 JSON"
+                for issue in exc.errors(include_input=False)
+            )
+            yield f"**参数校验失败**：无法读取有效的策略参数（{locations}）。请检查输入后重试。"
+            return
+        except Exception as exc:
+            logger.exception("DeepSeek 策略解析失败")
+            yield f"**策略解析失败**：DeepSeek 未能返回参数（{type(exc).__name__}）。请检查 API 配置后重试。"
+            return
 
-        # 第三个参数context就是middlewear.py中上下文runtime中的信息，就是我们做提示词切换的标记
-        for chunk in self.agent.stream(input_dict, stream_mode="values", context={"report": False}):
-            latest_message = chunk["messages"][-1]
-            if latest_message.content:
-                yield latest_message.content.strip() + "\n"
+        issues = self._draft.input_issues(today)
+        if issues:
+            yield "**需要补齐或调整回测参数**\n\n" + "\n".join(f"- {issue}" for issue in issues)
+            return
+
+        try:
+            report = execute_backtest(self._draft)
+        except BacktestStageError as exc:
+            yield f"**{exc.stage}失败**：{exc}"
+            return
+        self._draft = None
+        yield report
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     agent = ReactAgent()
-
-    for chunk in agent.execute_stream('''我想测试一个基于成交量放量的突破策略。具体来说，我希望策略能够监控每只股票的成交量变化，当某只股票的成交量突然放大，并且当天的收盘价也突破了最近20个交易日的最高价时，就买入这只股票。买入时使用账户总资金的5%，并且设置止损条件，如果股价从买入价下跌了8%就卖出止损。如果没有触发止损，就持有股票直到股价上涨了10%时止盈卖出。如果股价既没有达到止损也没有达到止盈，就持有最多10个交易日，无论盈亏都卖出。回测的时间范围是从2023年6月1日到2023年12月31日。这个策略应该同时监控多只股票，但每只股票独立计算信号和持仓。'''):
-        print(chunk, end="", flush=True)
-
+    while query := input("回测请求（空行退出）：").strip():
+        for message in agent.execute_stream(query):
+            print(message)

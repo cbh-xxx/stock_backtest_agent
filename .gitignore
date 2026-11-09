@@ -18,3 +18,4 @@ chroma_db/
 
 # Local records unrelated to stock backtesting
 /data/external/records.csv
+/.streamlit/secrets.toml
