@@ -158,6 +158,8 @@ def _stock_bars(
         in_period = tradable.loc[tradable.index.date >= start]
         if in_period.empty:
             raise MarketDataError(f"{code} 在 {start} 至 {end} 没有可交易日线。")
+        if warmup == 0:
+            return _numeric_bars(code, in_period, STOCK_COLUMNS)
         if len(history) >= warmup:
             warmup_start = history.index[0].date()
             _require_dates(code, frame, _calendar(warmup_start, start - timedelta(days=1)))
@@ -168,16 +170,24 @@ def _stock_bars(
 
 
 def load_market_data(spec: StrategySpec) -> MarketData:
-    start, end = spec.start, spec.end
+    return fetch_daily_market_data(
+        spec.start, spec.end, max(signal.warmup() for signal in spec.entry),
+        spec.stocks, spec.benchmark,
+    )
+
+
+def fetch_daily_market_data(
+    start: date, end: date, warmup: int,
+    symbols: list[str] | None = None, benchmark: str | None = None,
+) -> MarketData:
     benchmark_code = None
-    if spec.benchmark:
-        benchmark_name = spec.benchmark.replace(" ", "").replace("上证综指", "上证指数")
+    if benchmark:
+        benchmark_name = benchmark.replace(" ", "").replace("上证综指", "上证指数")
         if benchmark_name != "上证指数":
             benchmark_name = benchmark_name.removesuffix("指数")
         benchmark_code = BENCHMARK_CODES.get(benchmark_name) or _code(benchmark_name, benchmark=True)
         if benchmark_code not in BENCHMARK_CODES.values():
             raise BacktestInputError("基准仅支持上证指数、沪深300、中证500或深证成指。")
-    warmup = max(signal.warmup() for signal in spec.entry)
     # BaoStock SDK 使用进程级连接，串行使用完整会话。
     with _SESSION_LOCK:
         _check_response(bs.login(), "连接 BaoStock")
@@ -186,7 +196,7 @@ def load_market_data(spec: StrategySpec) -> MarketData:
             if not required:
                 raise MarketDataError(f"{start} 至 {end} 没有交易日。")
             stocks = {}
-            for value in spec.stocks or DEFAULT_STOCKS:
+            for value in symbols or DEFAULT_STOCKS:
                 stock = _stock_info(value)
                 code = stock["code"]
                 if code not in stocks:

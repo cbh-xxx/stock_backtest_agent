@@ -1,4 +1,4 @@
-# DeepSeek 官方 API 的 V4.1 Flash 模型 ID，供回测规则解析和原有 RAG 总结共用。
+# DeepSeek 官方 API 模型，供工具调度、策略代码生成和 RAG 总结使用。
 chat_model_name: deepseek-flash
 # 现有 Chroma 索引使用百炼的嵌入模型，查询向量须与索引一致。
 embedding_model_name: text-embedding-v4
