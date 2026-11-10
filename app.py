@@ -124,7 +124,11 @@ if session.dataset:
 
 if session.runs:
     run_ids = list(reversed(session.runs))
-    run = session.runs[st.selectbox("查看当前会话的回测结果", run_ids, key=f"reports-{run_ids[0]}")]
+    run_numbers = {run_id: number for number, run_id in enumerate(session.runs, start=1)}
+    run = session.runs[st.selectbox(
+        "查看当前会话的回测结果", run_ids, key=f"reports-{run_ids[0]}",
+        format_func=lambda run_id: f"第 {run_numbers[run_id]} 次 · {run_id}",
+    )]
     st.markdown(run.report())
     with st.expander("本次运行使用的规则"):
         st.code(run.request.version.rules.as_json(), language="json")
@@ -134,10 +138,14 @@ if session.runs:
         st.dataframe(run.request.dataset.coverage(), hide_index=True)
     if run.result.fills:
         st.markdown("#### 成交明细")
-        st.dataframe([fill.model_dump(mode="json") for fill in run.result.fills], hide_index=True)
+        st.dataframe([
+            fill.model_dump(mode="json", exclude={"signal_detail"}) for fill in run.result.fills
+        ], hide_index=True)
     if run.result.unfilled:
         with st.expander("未成交订单"):
-            st.dataframe([row.model_dump(mode="json") for row in run.result.unfilled], hide_index=True)
+            st.dataframe([
+                row.model_dump(mode="json", exclude={"signal_detail"}) for row in run.result.unfilled
+            ], hide_index=True)
     for kind, title in (("equity", "净值图"), ("drawdown", "回撤图")):
         if kind in run.charts:
             st.markdown(f"#### {title}")

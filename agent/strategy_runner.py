@@ -3,6 +3,7 @@ import importlib.util
 import json
 import sys
 from datetime import date
+from math import isfinite
 from pathlib import Path
 
 import backtrader as bt
@@ -37,6 +38,16 @@ class DailyBroker(bt.brokers.BackBroker):
         return super().submit(order, check=check)
 
 
+def _json_observations(value):
+    if isinstance(value, dict):
+        return {key: _json_observations(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_observations(item) for item in value]
+    if isinstance(value, float) and not isfinite(value):
+        return None
+    return value
+
+
 class Capture(bt.Analyzer):
     def start(self):
         self.equity = {}
@@ -51,10 +62,13 @@ class Capture(bt.Analyzer):
 
     def notify_order(self, order):
         entry = {
+            "order_ref": int(order.ref),
             "symbol": order.data._name,
             "side": "买入" if order.isbuy() else "卖出",
             "signal_date": bt.num2date(order.created.dt).date().isoformat(),
-            "reason": str(order.info.get("runner_reason") or order.info.get("reason") or "")[:160],
+            "reason": str(order.info.get("reason") or "")[:160],
+            "status": order.getstatusname(),
+            "signal_detail": _json_observations(order.info.get("signal_detail")),
         }
         if order.alive():
             self.pending[order.ref] = entry
@@ -69,7 +83,9 @@ class Capture(bt.Analyzer):
                 "fee": float(order.executed.comm),
             })
         else:
-            entry["reason"] = entry["reason"] or order.getstatusname()
+            entry["failure_reason"] = str(order.info.get("runner_reason") or (
+                "可用资金或保证金不足" if order.status == order.Margin else order.getstatusname()
+            ))[:160]
             self.unfilled.append(entry)
 
     def get_analysis(self):
@@ -77,7 +93,7 @@ class Capture(bt.Analyzer):
             "equity": [{"date": day, "value": value} for day, value in sorted(self.equity.items())],
             "fills": self.fills,
             "unfilled": self.unfilled + [
-                {**entry, "reason": "回测区间结束，订单未成交"} for entry in self.pending.values()
+                {**entry, "failure_reason": "回测区间结束，订单未成交"} for entry in self.pending.values()
             ],
             "holdings": {
                 data._name: float(self.strategy.getposition(data).size)

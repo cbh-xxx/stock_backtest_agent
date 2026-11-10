@@ -37,6 +37,10 @@ class OrderRecord(ResultRow):
     side: str
     signal_date: date
     reason: str
+    order_ref: int | None = None
+    status: str | None = None
+    failure_reason: str | None = None
+    signal_detail: dict | None = None
 
 
 class Fill(OrderRecord):

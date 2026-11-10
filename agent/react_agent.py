@@ -11,6 +11,7 @@ from langchain_core.tools import StructuredTool
 
 from agent.backtest_spec import DEFAULT_STOCKS, EARLIEST_DATE
 from agent.market_data import fetch_daily_market_data
+from agent.run_context import RunContextError, context_for_chat, read_run_details
 from agent.run_strategy import run_approved_strategy
 from agent.strategy_codegen import write_strategy
 from agent.strategy_compiler import compile_strategy
@@ -35,7 +36,7 @@ class ReactAgent:
             handler.__name__: StructuredTool.from_function(handler)
             for handler in (
                 self.generate_strategy_code, self.modify_strategy_code,
-                self.fetch_market_data, self.execute_strategy_code,
+                self.fetch_market_data, self.execute_strategy_code, self.query_backtest_details,
             )
         }
         self.chart_tool = StructuredTool.from_function(self.render_backtest_charts)
@@ -188,6 +189,22 @@ class ReactAgent:
         run.render_charts(chart_types)
         return {"run_id": run_id, "charts": list(run.charts)}
 
+    def query_backtest_details(
+        self, run: str, section: Literal["summary", "equity", "fills", "unfilled", "market"],
+        symbol: str | None = None, start_date: str | None = None, end_date: str | None = None,
+        offset: int = 0, limit: int = 100,
+    ) -> dict:
+        """只读查询已完成回测。run 为运行编号、从 1 开始的序号或 latest。
+
+        symbol 使用完整代码，可省略；日期使用 YYYY-MM-DD。成交可按信号日或成交日匹配。
+        返回 next_offset 时可用它继续取同一查询的下一页。此工具不会运行策略或重新下载行情。
+        """
+        return read_run_details(
+            self.session.runs, run.strip(), section, symbol,
+            date.fromisoformat(start_date) if start_date else None,
+            date.fromisoformat(end_date) if end_date else None, offset, limit,
+        )
+
     @staticmethod
     def _today() -> date:
         return datetime.now(timezone(timedelta(hours=8))).date()
@@ -231,6 +248,19 @@ class ReactAgent:
             )
             break
 
+    def _remember_messages(self, messages: list):
+        # 当前轮次保留工具明细供模型回答。历史中只留查阅记录，避免反复附带同一批日线。
+        remembered = []
+        for message in messages:
+            if isinstance(message, ToolMessage) and message.name == "query_backtest_details":
+                outcome = json.loads(message.content)
+                if "rows" in outcome:
+                    rows = outcome.pop("rows")
+                    outcome.update(row_count=len(rows), details_available_via="query_backtest_details")
+                    message = message.model_copy(update={"content": json.dumps(outcome, ensure_ascii=False)})
+            remembered.append(message)
+        self.messages = remembered
+
     def execute_stream(self, query: str):
         if self.session.in_progress:
             yield "当前回测正在运行。"
@@ -239,19 +269,29 @@ class ReactAgent:
         self.events = []
         # 暂存消息，避免一次 API 异常把未配对的工具调用留在下一轮历史里。
         turn = [*self.messages, HumanMessage(content=query)]
+        omitted_runs: dict[str, int] = {}
+
+        def with_notice(message: str) -> str:
+            if not omitted_runs:
+                return message
+            runs = "、".join(f"第 {number} 次（{run_id}）" for run_id, number in omitted_runs.items())
+            return message + f"\n\n> 本轮上下文曾缩减以下回测的完整明细：{runs}。具体记录可按运行或日期补查。"
+
         try:
             from model.factory import chat_model
 
             model = chat_model.bind_tools(list(self.tools.values()))
             for _ in range(_MAX_STEPS):
-                response = model.invoke([self._system(), *turn])
+                system, omitted = context_for_chat(self._system().content, turn, self.session.runs)
+                omitted_runs.update((entry["run_id"], entry["run_number"]) for entry in omitted)
+                response = model.invoke([SystemMessage(content=system), *turn])
                 turn.append(response)
                 if not response.tool_calls:
-                    self.messages = turn
+                    self._remember_messages(turn)
                     if response.invalid_tool_calls:
-                        yield "DeepSeek 返回了无法读取的工具参数，请重新描述请求。"
+                        yield with_notice("DeepSeek 返回了无法读取的工具参数，请重新描述请求。")
                     else:
-                        yield StrOutputParser().invoke(response).strip() or "请提供策略规则和回测区间。"
+                        yield with_notice(StrOutputParser().invoke(response).strip() or "请提供策略规则和回测区间。")
                     return
                 failure = None
                 for call in response.tool_calls:
@@ -274,18 +314,20 @@ class ReactAgent:
                         content=json.dumps(outcome, ensure_ascii=False, default=str),
                         name=name, tool_call_id=call["id"],
                     ))
-                self.messages = turn
+                self._remember_messages(turn)
                 if failure:
-                    yield failure
+                    yield with_notice(failure)
                     return
                 if self.session.pending:
-                    yield "回测已准备好。核对下方源码和参数后，点击「执行代码」即可运行。"
+                    yield with_notice("回测已准备好。核对下方源码和参数后，点击「执行代码」即可运行。")
                     return
-            yield "本轮工具调用已达到上限，已生成的版本和行情仍可在页面查看。"
+            yield with_notice("本轮工具调用已达到上限，已生成的版本和行情仍可在页面查看。")
+        except RunContextError as exc:
+            yield with_notice(str(exc))
         except Exception as exc:
             logger.exception("DeepSeek 工具调度失败")
             # 上一条完整配对的消息已保留；失败的模型响应不会进入下轮。
-            yield f"DeepSeek 工具调度失败（{type(exc).__name__}）。请检查 API 配置或日志后重试。"
+            yield with_notice(f"DeepSeek 工具调度失败（{type(exc).__name__}）。请检查 API 配置或日志后重试。")
 
     def _automatic_charts(self, run: CompletedRun):
         from model.factory import chat_model

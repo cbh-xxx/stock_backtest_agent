@@ -29,9 +29,40 @@ def _expression(condition: Condition) -> str:
     return f"data.close[0] {op} {extreme}(data.{line}.get(ago=-1, size={condition.period}))"
 
 
+def _observations(condition: Condition, path: tuple[int, ...] = ()) -> Iterator[str]:
+    if isinstance(condition, Group):
+        for index, child in enumerate(condition.conditions):
+            yield from _observations(child, (*path, index))
+        return
+    if isinstance(condition, RSI):
+        observed = f"'rsi': self.rsi_{condition.period}[data][0]"
+    elif isinstance(condition, VolumeRatio):
+        average = f"avg_volume_{condition.period}"
+        observed = (
+            f"'volume': data.volume[0], 'historical_mean': {average}, "
+            f"'ratio': data.volume[0] / {average} if {average} > 0 else None"
+        )
+    elif isinstance(condition, MACross):
+        fast, slow = condition.fast, condition.slow
+        observed = (
+            f"'previous_fast': previous_sma_{fast}, 'previous_slow': previous_sma_{slow}, "
+            f"'fast': sma_{fast}, 'slow': sma_{slow}"
+        )
+    else:
+        line, extreme = ("high", "max") if condition.direction == "above" else ("low", "min")
+        observed = (
+            f"'close': data.close[0], "
+            f"'historical_boundary': {extreme}(data.{line}.get(ago=-1, size={condition.period}))"
+        )
+    yield (
+        f"{{'path': {list(path)!r}, 'rule': {condition.model_dump()!r}, "
+        f"'matched': {_expression(condition)}, 'observed': {{{observed}}}}}"
+    )
+
+
 def _signal_method(name: str, condition: Condition) -> str:
     leaves = tuple(_leaves(condition))
-    body = [f"    def {name}(self, data):"]
+    body = [f"    def {name}(self, data, trace=False):"]
     for period in sorted({node.period for node in leaves if isinstance(node, VolumeRatio)}):
         body.append(f"        avg_volume_{period} = mean(data.volume.get(ago=-1, size={period}))")
     sma = {period for node in leaves if isinstance(node, MACross) for period in (node.fast, node.slow)}
@@ -40,7 +71,14 @@ def _signal_method(name: str, condition: Condition) -> str:
             f"        previous_sma_{period} = mean(data.close.get(ago=-1, size={period}))",
             f"        sma_{period} = mean(data.close.get(size={period}))",
         ])
-    body.append("        return " + _expression(condition).replace("\n", "\n        "))
+    body.append("        matched = " + _expression(condition).replace("\n", "\n        "))
+    body.extend([
+        "        if not trace:",
+        "            return matched",
+        "        return {'matched': matched, 'conditions': [",
+        *(f"            {observation}," for observation in _observations(condition)),
+        "        ]}",
+    ])
     return "\n".join(body)
 
 
@@ -51,25 +89,28 @@ def _exit_method(rules: StrategyRules) -> str:
     if rules.stop_loss is not None:
         body.extend([
             f"        if change <= -{rules.stop_loss!r} + 1e-12:",
-            '            return "止损"',
+            f"""            return "止损", {{'kind': 'stop_loss', 'threshold': {rules.stop_loss!r},""",
+            "                            'return_fraction': change, 'entry_price': position.price, 'close': data.close[0]}",
         ])
     if rules.take_profit is not None:
         body.extend([
             f"        if change >= {rules.take_profit!r} - 1e-12:",
-            '            return "止盈"',
+            f"""            return "止盈", {{'kind': 'take_profit', 'threshold': {rules.take_profit!r},""",
+            "                            'return_fraction': change, 'entry_price': position.price, 'close': data.close[0]}",
         ])
     if rules.max_hold_days is not None:
         body.extend([
             "        held_days = len(data) - self.entry_bars[data] + 1",
             f"        if held_days >= {rules.max_hold_days!r}:",
-            '            return "最长持有期"',
+            f"""            return "最长持有期", {{'kind': 'max_hold_days', 'threshold': {rules.max_hold_days!r},""",
+            "                               'held_days': held_days}",
         ])
     if rules.exit is not None:
         body.extend([
             "        if self._exit_signal(data):",
-            '            return "退出条件满足"',
+            '            return "退出条件满足", self._exit_signal(data, trace=True)',
         ])
-    body.append("        return None")
+    body.append("        return None, None")
     return "\n".join(body)
 
 
@@ -84,16 +125,22 @@ _NEXT = '''    def next(self):
                 continue
             position = self.getposition(data)
             if position.size:
-                reason = self._exit_reason(data, position)
+                reason, signal_detail = self._exit_reason(data, position)
                 if reason:
-                    self.pending[data] = self.close(data=data, reason=reason)
+                    self.pending[data] = self.close(data=data, reason=reason, signal_detail=signal_detail)
                 continue
             if self._entry_met(data):
                 budget = min(self.broker.getvalue() * self.position_fraction, self.broker.getcash())
                 commission = self.broker.getcommissioninfo(data).p.commission
                 shares = int(budget / (data.close[0] * (1 + commission)))
                 if shares > 0:
-                    self.pending[data] = self.buy(data=data, size=shares, reason="入场条件满足")
+                    signal_detail = self._entry_met(data, trace=True)
+                    signal_detail.update({
+                        "signal_close": data.close[0], "budget": budget, "requested_shares": shares,
+                    })
+                    self.pending[data] = self.buy(
+                        data=data, size=shares, reason="入场条件满足", signal_detail=signal_detail,
+                    )
 
     # 个别标的尚未到达首个回测日时，其余预热完成的标的仍可按自身日线运行。
     prenext = next
