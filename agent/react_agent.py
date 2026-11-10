@@ -1,4 +1,5 @@
 import json
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from math import isfinite
 from pathlib import Path
@@ -24,14 +25,26 @@ from utils.logger_handler import logger
 
 _PROMPT = Path(__file__).resolve().parents[1] / "prompts" / "code_agent_prompt.txt"
 _MAX_STEPS = 12
+_BEIJING = timezone(timedelta(hours=8))
 ChartType = Literal["equity", "drawdown"]
+TimelineKind = Literal["user", "assistant", "error", "version", "dataset", "confirmation", "run"]
+
+
+@dataclass
+class TimelineEntry:
+    kind: TimelineKind
+    content: str | CodeVersion | Dataset | RunRequest | CompletedRun
+    time: datetime = field(default_factory=lambda: datetime.now(_BEIJING))
+    tools: list[tuple[str, str]] = field(default_factory=list)
+    status: str = ""
+    reason: str = ""
 
 
 class ReactAgent:
     def __init__(self):
         self.session = StrategySession()
         self.messages = []
-        self.events: list[tuple[str, str]] = []
+        self.timeline: list[TimelineEntry] = []
         self.tools = {
             handler.__name__: StructuredTool.from_function(handler)
             for handler in (
@@ -40,6 +53,13 @@ class ReactAgent:
             )
         }
         self.chart_tool = StructuredTool.from_function(self.render_backtest_charts)
+
+    def add_timeline_entry(
+        self, kind: TimelineKind, content: str | CodeVersion | Dataset | RunRequest | CompletedRun,
+    ) -> TimelineEntry:
+        entry = TimelineEntry(kind, content)
+        self.timeline.append(entry)
+        return entry
 
     def _save_version(
         self, rules: StrategyRules, requirements: str, references: tuple[str, ...],
@@ -56,6 +76,7 @@ class ReactAgent:
             state.version = version
             pending = state.pending
             state.pending = None
+            self.add_timeline_entry("version", version)
         if pending is not None:
             self._finish_execution_message(pending.id, {"status": "cancelled", "reason": "代码版本已变化。"})
         return version
@@ -107,6 +128,7 @@ class ReactAgent:
             pending = self.session.pending
             self.session.pending = None
             self.session.dataset = dataset
+            self.add_timeline_entry("dataset", dataset)
         if pending is not None:
             self._finish_execution_message(pending.id, {"status": "cancelled", "reason": "回测行情已变化。"})
         return {
@@ -120,6 +142,13 @@ class ReactAgent:
         starting_cash: float = DEFAULT_CASH, commission: float = DEFAULT_COMMISSION,
     ) -> dict:
         """提交待确认运行请求。手续费使用小数，例如 0.001 表示 0.1%。实际执行须由用户在页面确认。"""
+        request = self._prepare_run(code_version, dataset_id, starting_cash, commission, show_confirmation=True)
+        return {"status": "pending_confirmation", "run_request_id": request.id, "summary": request.describe()}
+
+    def _prepare_run(
+        self, code_version: str, dataset_id: str, starting_cash: float, commission: float,
+        *, show_confirmation: bool,
+    ) -> RunRequest:
         self._check_account(starting_cash, commission)
         state = self.session
         with state.lock:
@@ -134,7 +163,9 @@ class ReactAgent:
             state.pending = request
             state.starting_cash = starting_cash
             state.commission = commission
-        return {"status": "pending_confirmation", "run_request_id": request.id, "summary": request.describe()}
+            if show_confirmation:
+                self.add_timeline_entry("confirmation", request).status = "待确认"
+        return request
 
     @staticmethod
     def _check_account(starting_cash: float, commission: float):
@@ -145,7 +176,7 @@ class ReactAgent:
         self, code_version: str, start: date, end: date, symbols: list[str] | None,
         benchmark: str | None, starting_cash: float, commission: float,
     ) -> CompletedRun:
-        """只由源码下方的按钮调用，一次点击确认本次显示的代码与参数。"""
+        """由时间线中的执行按钮调用，一次点击确认本次显示的代码与参数。"""
         state = self.session
         version, dataset, pending = state.version, state.dataset, state.pending
         if state.in_progress or version is None or version.id != code_version:
@@ -169,17 +200,19 @@ class ReactAgent:
         if reuse_data:
             dataset_id = dataset.id
         else:
+            first_entry = len(self.timeline)
             try:
                 prepared = self.fetch_market_data(
                     str(start), str(end), version.warmup_bars, symbols, benchmark,
                 )
             except Exception as exc:
-                self.events.append(("fetch_market_data", "失败"))
-                raise ValueError(f"行情准备失败：{exc}") from exc
-            self.events.append(("fetch_market_data", "完成"))
+                message = f"行情准备失败：{exc}"
+                self.add_timeline_entry("error", message).tools.append(("fetch_market_data", "失败"))
+                raise ValueError(message) from exc
+            self.timeline[first_entry].tools.append(("fetch_market_data", "完成"))
             dataset_id = prepared["dataset_id"]
-        request = self.execute_strategy_code(version.id, dataset_id, starting_cash, commission)
-        return self.approve(request["run_request_id"])
+        request = self._prepare_run(version.id, dataset_id, starting_cash, commission, show_confirmation=False)
+        return self.approve(request.id)
 
     def render_backtest_charts(self, run_id: str, chart_types: list[ChartType]) -> dict:
         """为已完成的本次回测自动绘图。chart_types 同时传入 equity 和 drawdown。"""
@@ -207,7 +240,7 @@ class ReactAgent:
 
     @staticmethod
     def _today() -> date:
-        return datetime.now(timezone(timedelta(hours=8))).date()
+        return datetime.now(_BEIJING).date()
 
     def _system(self):
         version, dataset = self.session.version, self.session.dataset
@@ -235,6 +268,8 @@ class ReactAgent:
             self._finish_execution_message(request.id, {"status": "cancelled"})
 
     def _finish_execution_message(self, request_id: str, outcome: dict):
+        status = {"cancelled": "已取消", "completed": "已完成", "error": "执行失败"}[outcome["status"]]
+        self._update_confirmation(request_id, status, outcome.get("reason", ""))
         for index in range(len(self.messages) - 1, -1, -1):
             message = self.messages[index]
             if not isinstance(message, ToolMessage) or message.name != "execute_strategy_code":
@@ -246,6 +281,13 @@ class ReactAgent:
                 content=json.dumps({**outcome, "run_request_id": request_id}, ensure_ascii=False),
             )
             break
+
+    def _update_confirmation(self, request_id: str, status: str, reason: str = ""):
+        for entry in reversed(self.timeline):
+            if entry.kind == "confirmation" and entry.content.id == request_id:
+                entry.status = status
+                entry.reason = reason
+                break
 
     def _remember_messages(self, messages: list):
         # 当前轮次保留工具明细供模型回答。历史中只留查阅记录，避免反复附带同一批日线。
@@ -261,20 +303,24 @@ class ReactAgent:
         self.messages = remembered
 
     def execute_stream(self, query: str):
+        self.add_timeline_entry("user", query)
         if self.session.in_progress:
-            yield "当前回测正在运行。"
+            message = "当前回测正在运行。"
+            self.add_timeline_entry("assistant", message)
+            yield message
             return
         self.cancel_pending()
-        self.events = []
         # 暂存消息，避免一次 API 异常把未配对的工具调用留在下一轮历史里。
         turn = [*self.messages, HumanMessage(content=query)]
         omitted_runs: dict[str, int] = {}
+        reply_tools: list[tuple[str, str]] = []
 
-        def with_notice(message: str) -> str:
-            if not omitted_runs:
-                return message
-            runs = "、".join(f"第 {number} 次（{run_id}）" for run_id, number in omitted_runs.items())
-            return message + f"\n\n> 本轮上下文曾缩减以下回测的完整明细：{runs}。具体记录可按运行或日期补查。"
+        def reply(message: str, *, error: bool = False) -> str:
+            if omitted_runs:
+                runs = "、".join(f"第 {number} 次（{run_id}）" for run_id, number in omitted_runs.items())
+                message += f"\n\n> 本轮上下文曾缩减以下回测的完整明细：{runs}。具体记录可按运行或日期补查。"
+            self.add_timeline_entry("error" if error else "assistant", message).tools.extend(reply_tools)
+            return message
 
         try:
             from model.factory import chat_model
@@ -288,45 +334,48 @@ class ReactAgent:
                 if not response.tool_calls:
                     self._remember_messages(turn)
                     if response.invalid_tool_calls:
-                        yield with_notice("DeepSeek 返回了无法读取的工具参数，请重新描述请求。")
+                        yield reply("DeepSeek 返回了无法读取的工具参数，请重新描述请求。", error=True)
                     else:
-                        yield with_notice(StrOutputParser().invoke(response).strip() or "请提供策略规则和回测区间。")
+                        yield reply(StrOutputParser().invoke(response).strip() or "请提供策略规则和回测区间。")
                     return
                 failure = None
                 for call in response.tool_calls:
                     name = call["name"]
                     if self.session.pending or failure:
                         outcome = {"status": "skipped", "reason": "本轮正在等待确认或已有工具失败。"}
-                        self.events.append((name, "跳过"))
+                        reply_tools.append((name, "跳过"))
                     else:
+                        first_entry = len(self.timeline)
                         try:
                             if name not in self.tools:
                                 raise ValueError("工具未注册。")
                             outcome = self.tools[name].invoke(call["args"])
-                            self.events.append((name, "等待确认" if self.session.pending else "完成"))
+                            status = "等待确认" if self.session.pending else "完成"
+                            tools = self.timeline[first_entry].tools if len(self.timeline) > first_entry else reply_tools
+                            tools.append((name, status))
                         except Exception as exc:
                             logger.exception("回测工具失败：%s", name)
                             failure = f"{name} 失败：{exc}"
                             outcome = {"status": "error", "reason": str(exc)}
-                            self.events.append((name, "失败"))
+                            reply_tools.append((name, "失败"))
                     turn.append(ToolMessage(
                         content=json.dumps(outcome, ensure_ascii=False, default=str),
                         name=name, tool_call_id=call["id"],
                     ))
                 self._remember_messages(turn)
                 if failure:
-                    yield with_notice(failure)
+                    yield reply(failure, error=True)
                     return
                 if self.session.pending:
-                    yield with_notice("回测已准备好。核对下方源码和参数后，点击「执行代码」即可运行。")
+                    yield reply("回测已准备好。请在对应策略条目审阅源码，再到待确认条目核对参数并点击「执行代码」。")
                     return
-            yield with_notice("本轮工具调用已达到上限，已生成的版本和行情仍可在页面查看。")
+            yield reply("本轮工具调用已达到上限，已生成的版本和行情仍可在时间线查看。", error=True)
         except RunContextError as exc:
-            yield with_notice(str(exc))
+            yield reply(str(exc), error=True)
         except Exception as exc:
             logger.exception("DeepSeek 工具调度失败")
             # 上一条完整配对的消息已保留；失败的模型响应不会进入下轮。
-            yield with_notice(f"DeepSeek 工具调度失败（{type(exc).__name__}）。请检查 API 配置或日志后重试。")
+            yield reply(f"DeepSeek 工具调度失败（{type(exc).__name__}）。请检查 API 配置或日志后重试。", error=True)
 
     def _automatic_charts(self, run: CompletedRun):
         from model.factory import chat_model
@@ -355,9 +404,12 @@ class ReactAgent:
                 raise ValueError("运行请求已过期、已使用，或当前已有运行。")
             if state.version is not request.version or state.dataset is not request.dataset:
                 state.pending = None
-                raise ValueError("代码或行情已变化，请重新提出运行请求。")
+                reason = "代码或行情已变化，请重新提出运行请求。"
+                self._finish_execution_message(request.id, {"status": "cancelled", "reason": reason})
+                raise ValueError(reason)
             state.pending = None
             state.in_progress = True
+            self._update_confirmation(request.id, "执行中")
         try:
             result = run_approved_strategy(
                 request.version.source, request.version.warmup_bars, request.dataset.market,
@@ -365,21 +417,23 @@ class ReactAgent:
             )
             run = CompletedRun(request, result)
             state.runs[request.id] = run
-            self.events.append(("execute_strategy_code", "执行完成"))
+            entry = self.add_timeline_entry("run", run)
+            entry.tools.append(("execute_strategy_code", "执行完成"))
             self._finish_execution_message(request.id, {
                 "status": "completed", "run_id": request.id,
             })
             try:
                 self._automatic_charts(run)
-                self.events.append(("render_backtest_charts", "完成"))
+                entry.tools.append(("render_backtest_charts", "完成"))
             except Exception as exc:
                 logger.exception("自动绘图失败")
                 run.chart_error = f"自动绘图失败（{type(exc).__name__}），报告仍可查看。"
-                self.events.append(("render_backtest_charts", "失败"))
+                entry.tools.append(("render_backtest_charts", "失败"))
             return run
         except Exception as exc:
             self._finish_execution_message(request.id, {"status": "error", "reason": str(exc)})
-            self.events.append(("execute_strategy_code", "执行失败"))
+            entry = self.add_timeline_entry("error", f"回测执行失败：{exc}")
+            entry.tools.append(("execute_strategy_code", "执行失败"))
             raise
         finally:
             with state.lock:
