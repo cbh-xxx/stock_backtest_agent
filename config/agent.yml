@@ -1,5 +1,0 @@
-stock_data_path: stock_data/stocks_all.csv
-indices_data_path: stock_data/indices_all.csv
-backtest_start_date: 2023-01-01
-backtest_end_date: 2024-12-31
-external_data_path: data/external/records.csv

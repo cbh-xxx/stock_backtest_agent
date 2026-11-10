@@ -14,8 +14,6 @@ venv/
 # Generated logs and knowledge base files
 logs/
 chroma_db/
-/md5.text
 
-# Local records unrelated to stock backtesting
-/data/external/records.csv
+# Local credentials
 /.streamlit/secrets.toml

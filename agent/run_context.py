@@ -1,7 +1,7 @@
 import json
 from datetime import date
 
-from agent.strategy_session import CompletedRun
+from agent.strategy_session import CompletedRun, Dataset
 
 
 # 用 UTF-8 字节作为保守的预算，并为工具定义及模型回复预留空间。
@@ -50,8 +50,8 @@ def _summary(number: int, run: CompletedRun) -> dict:
     }
 
 
-def _market_rows(run: CompletedRun, symbol: str | None = None):
-    market = run.request.dataset.market
+def _market_rows(dataset: Dataset, symbol: str | None = None):
+    market = dataset.market
     for code, frame in market.stocks.items():
         if symbol is None or symbol == code:
             for point in frame.itertuples():
@@ -69,7 +69,7 @@ MARKET_NOTE = "实际供回测使用的 BaoStock 日线，含预热期。股票�
 
 
 def _equity_rows(run: CompletedRun):
-    for point, drawdown in zip(run.result.equity, run.result.drawdowns(run.request.starting_cash)):
+    for point, drawdown in zip(run.result.equity, run.drawdowns):
         yield {**point.model_dump(mode="json"), "drawdown_fraction": drawdown}
 
 
@@ -79,7 +79,6 @@ def _full_details(number: int, run: CompletedRun) -> str:
         "equity": list(_equity_rows(run)),
         "fills": [item.model_dump(mode="json", exclude_none=True) for item in run.result.fills],
         "unfilled": [item.model_dump(mode="json", exclude_none=True) for item in run.result.unfilled],
-        "market": {"columns": MARKET_COLUMNS, "rows": list(_market_rows(run)), "note": MARKET_NOTE},
     })
 
 
@@ -95,27 +94,51 @@ def context_for_chat(
     budget = INPUT_BUDGET - history_size - _size(system) - _RESERVE
     ordered = list(enumerate(runs.values(), start=1))
     index = [_index_entry(number, run) for number, run in ordered]
-    omitted = [{"run_number": number, "run_id": run.request.id} for number, run in ordered]
+    identities = [{"run_number": number, "run_id": run.request.id} for number, run in ordered]
+    omitted = identities.copy()
+    market_header = {"columns": MARKET_COLUMNS, "note": MARKET_NOTE}
+
+    def base_size() -> int:
+        return _size(_json({
+            "run_index": index, "omitted_details": omitted, "details": [],
+            "market": {**market_header, "datasets": {}},
+        }))
+
     # 为所有摘要和可能省略的编号预留空间，再按新到旧追加整次运行。
-    remaining = budget - _size(_json({"run_index": index, "omitted_details": omitted, "details": []}))
+    remaining = budget - base_size()
     if remaining < 0:
-        index = omitted.copy()
-        remaining = budget - _size(_json({"run_index": index, "omitted_details": omitted, "details": []}))
+        index = identities.copy()
+        remaining = budget - base_size()
     if remaining < 0:
         raise RunContextError("本轮聊天历史和运行目录已超过可用上下文，无法继续发送。")
     details = []
     included = set()
+    market_blocks: dict[str, str] = {}
+    included_markets: dict[str, str] = {}
     for number, run in reversed(ordered):
         detail = _full_details(number, run)
-        cost = _size(detail) + 1
+        dataset = run.request.dataset
+        if dataset.id not in market_blocks:
+            market_blocks[dataset.id] = _json(dataset.id) + ":" + _json(list(_market_rows(dataset)))
+        market_block = market_blocks[dataset.id]
+        position = number - 1
+        identity = identities[position]
+        # 完整明细已含摘要，索引只保留定位用的编号。
+        saved = _size(_json(index[position])) - _size(_json(identity))
+        cost = _size(detail) + 1 - saved
+        if dataset.id not in included_markets:
+            cost += _size(market_block) + 1
         if cost > remaining:
             continue
         details.append(detail)
         included.add(run.request.id)
+        included_markets[dataset.id] = market_block
+        index[position] = identity
         remaining -= cost
     omitted = [entry for entry in omitted if entry["run_id"] not in included]
     prefix = _json({"run_index": index, "omitted_details": omitted})
-    context = prefix[:-1] + ',"details":[' + ",".join(reversed(details)) + "]}"
+    market = _json(market_header)[:-1] + ',"datasets":{' + ",".join(included_markets.values()) + "}}"
+    context = prefix[:-1] + ',"details":[' + ",".join(reversed(details)) + '],"market":' + market + "}"
     return system + "\n\n当前会话已完成的回测（JSON 数据）：\n" + context, omitted
 
 
@@ -154,7 +177,7 @@ def read_run_details(
 
     if section == "market":
         output.update(columns=MARKET_COLUMNS, note=MARKET_NOTE)
-        rows = (row for row in _market_rows(run, symbol) if matches(date.fromisoformat(row[1])))
+        rows = (row for row in _market_rows(run.request.dataset, symbol) if matches(date.fromisoformat(row[1])))
     elif section == "equity":
         rows = (row for row in _equity_rows(run) if matches(date.fromisoformat(row["date"])))
     elif section in ("fills", "unfilled"):

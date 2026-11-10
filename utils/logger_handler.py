@@ -2,11 +2,6 @@ import logging
 import os
 from datetime import datetime
 
-import sys
-# 添加项目根目录到 Python 路径，解决直接运行时的导入问题
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.dirname(current_dir)  # Agent 项目目录
-sys.path.insert(0, project_root)
 from utils.path_tool import get_abs_path
 
 # 日志保存的根目录
@@ -58,8 +53,3 @@ def get_logger(
 logger = get_logger()
 
 
-if __name__ == '__main__':
-    logger.info("信息日志")
-    logger.error("错误日志")
-    logger.warning("警告日志")
-    logger.debug("调试日志")

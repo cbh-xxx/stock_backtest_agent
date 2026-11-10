@@ -42,10 +42,9 @@ class CodeVersion:
 
     def tool_output(self) -> dict:
         return {
-            "code_version": self.id, "source": self.source,
+            "code_version": self.id,
             "rules": self.rules.model_dump(mode="json", exclude_none=True),
             "warmup_bars": self.warmup_bars, "references": self.references,
-            "diff": self.diff(),
         }
 
 
@@ -92,24 +91,30 @@ class CompletedRun:
     result: RunResult
     charts: dict[str, pd.DataFrame] = field(default_factory=dict)
     chart_error: str | None = None
+    drawdowns: tuple[float, ...] = field(init=False)
+    _metrics: dict = field(init=False, repr=False)
 
-    def metrics(self) -> dict:
+    def __post_init__(self) -> None:
         cash = self.request.starting_cash
         equity = self.result.equity[-1].value
-        return {
+        self.drawdowns = tuple(self.result.drawdowns(cash))
+        self._metrics = {
             "final_equity": equity,
             "total_return": equity / cash - 1,
-            "max_drawdown": max(self.result.drawdowns(cash)),
+            "max_drawdown": max(self.drawdowns),
             "fill_count": len(self.result.fills),
             "fees": sum(fill.fee for fill in self.result.fills),
         }
+
+    def metrics(self) -> dict:
+        return self._metrics.copy()
 
     def render_charts(self, chart_types: list[str]) -> None:
         dates = pd.to_datetime([point.date for point in self.result.equity])
         cash = self.request.starting_cash
         series = {
             "equity": ("净值（初始 = 1）", [point.value / cash for point in self.result.equity]),
-            "drawdown": ("回撤（%）", [100 * value for value in self.result.drawdowns(cash)]),
+            "drawdown": ("回撤（%）", [100 * value for value in self.drawdowns]),
         }
         self.charts = {
             kind: pd.DataFrame({series[kind][0]: series[kind][1]}, index=dates)
@@ -136,7 +141,7 @@ class CompletedRun:
 
 class StrategySession:
     def __init__(self):
-        self.versions: dict[str, CodeVersion] = {}
+        self.version_count = 0
         self.version: CodeVersion | None = None
         self.dataset: Dataset | None = None
         self.pending: RunRequest | None = None

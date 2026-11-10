@@ -24,7 +24,7 @@ class CodegenError(ValueError):
 def _open_index(content: str):
     from langchain_chroma import Chroma
     from langchain_core.documents import Document
-    from model.factory import EmbeddingsFactory
+    from model.factory import create_embeddings
     from utils.config_handler import rag_conf
 
     sections = re.split(r"^## ", content, flags=re.MULTILINE)[1:]
@@ -41,7 +41,7 @@ def _open_index(content: str):
     store = Chroma(
         collection_name=f"strategy_codegen_{version}",
         persist_directory=str(PROJECT / "chroma_db"),
-        embedding_function=EmbeddingsFactory().generator(),
+        embedding_function=create_embeddings(),
     )
     ids = [f"section-{index}" for index in range(len(docs))]
     existing = set(store.get(ids=ids)["ids"])

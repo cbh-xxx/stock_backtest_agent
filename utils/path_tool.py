@@ -29,6 +29,3 @@ def get_abs_path(relative_path: str) -> str:
     return os.path.join(project_root, relative_path)
 
 
-if __name__ == '__main__':
-    print(get_abs_path("config/config.txt"))
-    print('132')

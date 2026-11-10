@@ -11,7 +11,6 @@ from agent.backtest_spec import (
     DEFAULT_STOCKS,
     EARLIEST_DATE,
     BacktestInputError,
-    StrategySpec,
 )
 
 
@@ -167,13 +166,6 @@ def _stock_bars(
         if fetch_start == earliest:
             raise MarketDataError(f"{code} 在 {start} 之前需要 {warmup} 根预热日线，只有 {len(history)} 根。")
         days *= 2
-
-
-def load_market_data(spec: StrategySpec) -> MarketData:
-    return fetch_daily_market_data(
-        spec.start, spec.end, max(signal.warmup() for signal in spec.entry),
-        spec.stocks, spec.benchmark,
-    )
 
 
 def fetch_daily_market_data(

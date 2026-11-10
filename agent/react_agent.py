@@ -49,10 +49,10 @@ class ReactAgent:
         state = self.session
         with state.lock:
             version = CodeVersion(
-                id=f"v{len(state.versions) + 1}", rules=rules, source=source, warmup_bars=warmup,
+                id=f"v{state.version_count + 1}", rules=rules, source=source, warmup_bars=warmup,
                 requirements=requirements, references=references, previous=previous or state.version,
             )
-            state.versions[version.id] = version
+            state.version_count += 1
             state.version = version
             pending = state.pending
             state.pending = None
@@ -234,7 +234,7 @@ class ReactAgent:
         if request is not None:
             self._finish_execution_message(request.id, {"status": "cancelled"})
 
-    def _finish_execution_message(self, request_id: str, outcome: dict, result=None):
+    def _finish_execution_message(self, request_id: str, outcome: dict):
         for index in range(len(self.messages) - 1, -1, -1):
             message = self.messages[index]
             if not isinstance(message, ToolMessage) or message.name != "execute_strategy_code":
@@ -244,7 +244,6 @@ class ReactAgent:
             self.messages[index] = ToolMessage(
                 name=message.name, tool_call_id=message.tool_call_id,
                 content=json.dumps({**outcome, "run_request_id": request_id}, ensure_ascii=False),
-                artifact=result,
             )
             break
 
@@ -368,9 +367,8 @@ class ReactAgent:
             state.runs[request.id] = run
             self.events.append(("execute_strategy_code", "执行完成"))
             self._finish_execution_message(request.id, {
-                "status": "completed", "run_id": request.id, "metrics": run.metrics(),
-                "equity_points": len(result.equity),
-            }, result)
+                "status": "completed", "run_id": request.id,
+            })
             try:
                 self._automatic_charts(run)
                 self.events.append(("render_backtest_charts", "完成"))
